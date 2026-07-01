@@ -1,0 +1,10 @@
+# docker compose build でローカルベースイメージ j1/base.local を生成するための定義。
+#   $ docker compose -f compose.yml build
+# 生成後、build_and_push.sh が j1/base.local を ECR 用にタグ付けしてプッシュする。
+services:
+  base:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # ここで指定した名前がローカルベースイメージ名になる（要件: j1/base.local）
+    image: j1/base.local
