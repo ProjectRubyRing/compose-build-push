@@ -29,6 +29,7 @@ REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-ap-northeast-1}}"
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
 REGISTRY="${ECR_REGISTRY:-}"      # ECR レジストリ名(URL)。未指定なら <account>.dkr.ecr.<region>.amazonaws.com を組み立てる
 REPOSITORY="BaseImage"            # ECR 側リポジトリ名 (= プッシュするイメージ名)
+TAG_PREFIX="BaseImage"            # イメージタグの接頭辞。タグは <TAG_PREFIX>-<YYYYMMDDHHMMSS> となる (リポジトリ名とは独立)
 LOCAL_IMAGE="j1/base.local"       # compose build で生成されるローカルベースイメージ名
 CONTAINER_NAME=""                 # imagedefinition.json の name。未指定なら REPOSITORY を使用
 COMPOSE_FILE="compose.yml"
@@ -66,6 +67,9 @@ Options:
                            例: 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com
                            (未指定時は <account-id>.dkr.ecr.<region>.amazonaws.com を組み立て)
   --repository NAME        ECR リポジトリ名 = プッシュするイメージ名 (既定: BaseImage)
+  --tag-prefix PREFIX      イメージタグの接頭辞 (既定: BaseImage)。リポジトリ名とは独立に
+                           指定でき、タグは <PREFIX>-<YYYYMMDDHHMMSS> となる
+                           例: BaseImage-20260702153000
   --local-image NAME       compose build で生成されるローカルイメージ名 (既定: j1/base.local)
   --container-name NAME    imagedefinition.json の name (既定: --repository の値)
   --compose-file FILE      compose ファイル (既定: compose.yml)
@@ -90,6 +94,7 @@ while [ $# -gt 0 ]; do
     --region)           REGION="$2"; shift 2 ;;
     --registry)         REGISTRY="$2"; shift 2 ;;
     --repository)       REPOSITORY="$2"; shift 2 ;;
+    --tag-prefix)       TAG_PREFIX="$2"; shift 2 ;;
     --local-image)      LOCAL_IMAGE="$2"; shift 2 ;;
     --container-name)   CONTAINER_NAME="$2"; shift 2 ;;
     --compose-file)     COMPOSE_FILE="$2"; shift 2 ;;
@@ -224,8 +229,10 @@ else
   log "ローカルベースイメージを確認しました: $LOCAL_IMAGE"
 fi
 
-# ---- タグ (処理年月日時分秒) ------------------------------------------------
-IMAGE_TAG="$(date '+%Y%m%d%H%M%S')"          # 処理年月日時分秒
+# ---- タグ (<接頭辞>-<処理年月日時分秒>) -------------------------------------
+# タグの接頭辞 (TAG_PREFIX) はリポジトリ名とは独立に --tag-prefix で指定できる。
+# 例: TAG_PREFIX=BaseImage のとき BaseImage-20260702153000
+IMAGE_TAG="${TAG_PREFIX}-$(date '+%Y%m%d%H%M%S')"
 TARGET_IMAGE="${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
 
 # ---- ECR ログイン (get-login-password | docker login --password-stdin) -----
