@@ -9,6 +9,12 @@
 | `build_and_push.sh` | `compose.yml` を使った `docker compose build` |
 | `buildx_build_and_push.sh` | `docker buildx build` (compose 不使用)。ECR ログイン (`aws ecr get-login-password \| docker login`)、`docker image tag`、`docker image push` を個別コマンドで実行 |
 
+さらに、**ビルドのみを行う** (ECR へはプッシュしない) 専用スクリプトとして
+`build_and_verify.sh` を提供します。ビルドに加えて、コンテナを起動して
+**jbosseap (WildFly/JBoss EAP) サーバーの起動確認**や、**指定 URL への HTTP 応答確認**を
+任意で行えます。`build_and_push.sh --build-only` はこのスクリプトへ委譲されます
+(後述の「ビルドのみの実行 / 起動・URL 確認」を参照)。
+
 想定実行環境: RHEL 9.6 の EC2 インスタンス (bash / GNU coreutils / Docker CE)。
 
 ## 使い方
@@ -56,7 +62,7 @@
 | `--no-cache` | キャッシュを破棄してビルドする | `false` |
 | `--output FILE` | imagedefinition の出力先 | `imagedefinition.json` |
 | `--dry-run` | 実際のビルド/ログイン/タグ付け/プッシュ/ファイル出力は行わず、実行内容のプレビューのみ表示する | `false` |
-| `--build-only` | ビルドのみを実行する (**現状 compose 版のみ**)。ECR 権限チェック/ログイン/タグ付け/プッシュ/`imagedefinition.json` の出力は行わない。`--copy-file` 指定時は事前コピー → ビルド → 自動削除を行う | `false` |
+| `--build-only` | ビルドのみを実行する (**compose 版のみ**。処理は `build_and_verify.sh` に委譲)。ECR 権限チェック/ログイン/タグ付け/プッシュ/`imagedefinition.json` の出力は行わない。`--copy-file` 指定時は事前コピー → ビルド → 自動削除を行う。`--verify-startup` / `--verify-url` 等の追加オプションも委譲される (後述) | `false` |
 | `--copy-file SRC:DEST_DIR` | ビルド前に `SRC` を `DEST_DIR` へコピーし、ビルド終了後に自動削除する。繰り返し指定で複数ファイルに対応 | (なし) |
 | `--switchback-shell PATH` | 別チーム提供のスイッチバック用シェルのパス (source で呼び出し) | env: `SWITCHBACK_SHELL` |
 | `--auto-switchback` | ECR 権限が無い場合に自動でスイッチバックして継続する | `false` |
@@ -105,27 +111,80 @@ docker image push <registry>/<repository>:<tag>
   消してしまう事故を防ぐため処理を中止します。
 - `--dry-run` 併用時は、実際のコピー/削除は行わず実行内容のみ表示します。
 
-## ビルドのみの実行 (`--build-only`)
+## ビルドのみの実行 / 起動・URL 確認 (`build_and_verify.sh`)
 
-イメージのビルドだけを行い、ECR へのプッシュは行いたくない場合 (ローカルでの
-動作確認、CI でのビルド検証など) は `--build-only` を指定します。
+イメージのビルドだけを行い ECR へのプッシュは行わない処理は、専用スクリプト
+`build_and_verify.sh` に切り出しています。ローカルでの動作確認や CI でのビルド
+検証などに利用できます。`build_and_push.sh --build-only` を指定した場合も、
+このスクリプトへ委譲されます (`--build-only` を除いた引数がそのまま渡されます)。
 
 - ECR 権限チェック / ログイン / タグ付け / プッシュ / `imagedefinition.json` の
-  出力はいずれもスキップされ、ビルド完了後に終了します。
+  出力はいずれも行いません。
 - ECR を操作しないため、`--account-id` / `--registry` や AWS 認証情報は不要です
   (`aws` コマンドが無くても実行できます)。
 - **`--copy-file` が指定されている場合は、ビルド前に事前ファイルコピーを行った
-  うえでビルドし、ビルド後に自動削除します** (通常時と同じ挙動)。
+  うえでビルドし、処理後に自動削除します** (`build_and_push.sh` と同じ挙動)。
 
 ```bash
 # ビルドのみ (事前ファイルコピーあり)
-./build_and_push.sh --build-only \
+./build_and_verify.sh \
     --copy-file .npmrc:./app \
     --copy-file certs/ca.pem:./app/certs
 
+# build_and_push.sh 経由でも同じ (委譲される)
+./build_and_push.sh --build-only --copy-file .npmrc:./app
+
 # 何が実行されるかだけ確認 (ビルドも行わない)
-./build_and_push.sh --build-only --dry-run
+./build_and_verify.sh --dry-run
 ```
+
+### 起動確認 (`--verify-startup`)
+
+ビルドしたイメージをコンテナとして起動し、**jbosseap (WildFly/JBoss EAP)
+サーバーの起動完了**をログから確認します。確認後はコンテナを自動的に停止・削除
+します (`--keep-container` を付けると残せます)。
+
+- 起動完了とみなすログのパターンは既定で JBoss EAP / WildFly の起動完了メッセージ
+  (`WFLYSRV0025` / `WFLYSRV0026` = `started in ...`) です。別の起動メッセージを
+  使う場合は `--startup-log-pattern` (拡張正規表現) で上書きできます。
+- `--startup-timeout` (既定 120 秒) 以内に起動完了ログを検出できない場合、または
+  コンテナが起動途中で停止した場合は、コンテナログの末尾を表示して失敗終了します。
+
+```bash
+# ビルド + jbosseap 起動確認
+./build_and_verify.sh --verify-startup
+
+# 起動ログのパターン・待機時間を指定
+./build_and_verify.sh --verify-startup \
+    --startup-log-pattern 'WFLYSRV0025' --startup-timeout 180
+```
+
+### URL 応答確認 (`--verify-url`)
+
+jbosseap サーバーの起動後、**指定した URL へ HTTP リクエストを送り、その応答
+(ステータスコード / 本文) を確認**します。単独指定でもコンテナを起動して確認します
+(起動ログの確認も行う場合は `--verify-startup` を併用してください)。
+
+- 期待するステータスコードは `--expect-status` (既定 `200`) で指定します。
+- `--url-timeout` (既定 60 秒) 以内は `--url-interval` (既定 3 秒) ごとにリトライし、
+  期待するステータスコードが得られた時点で成功とします。サーバーが応答可能になる
+  までの待機 (readiness) も兼ねます。
+- 応答本文の先頭を表示するので、内容を目視で確認できます。
+
+```bash
+# ビルド + 起動確認 + ヘルスチェック URL の応答確認 (200 を期待)
+./build_and_verify.sh --verify-startup \
+    --verify-url http://localhost:8080/health --expect-status 200
+
+# POST で確認 / 自己署名証明書の HTTPS を許可
+./build_and_verify.sh --verify-startup \
+    --verify-url https://localhost:8443/api/ping \
+    --url-method POST --url-insecure --expect-status 204
+```
+
+> **補足**: 起動確認・URL 確認では `compose.yml` の定義に従ってコンテナを起動します
+> (`docker compose up -d`)。`--verify-url` で指定する URL のホスト/ポートは、
+> `compose.yml` のポートマッピングに合わせてください。
 
 ## push 失敗時の原因診断 / 調査ガイド
 
