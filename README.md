@@ -56,6 +56,7 @@
 | `--no-cache` | キャッシュを破棄してビルドする | `false` |
 | `--output FILE` | imagedefinition の出力先 | `imagedefinition.json` |
 | `--dry-run` | 実際のビルド/ログイン/タグ付け/プッシュ/ファイル出力は行わず、実行内容のプレビューのみ表示する | `false` |
+| `--build-only` | ビルドのみを実行する (**現状 compose 版のみ**)。ECR 権限チェック/ログイン/タグ付け/プッシュ/`imagedefinition.json` の出力は行わない。`--copy-file` 指定時は事前コピー → ビルド → 自動削除を行う | `false` |
 | `--copy-file SRC:DEST_DIR` | ビルド前に `SRC` を `DEST_DIR` へコピーし、ビルド終了後に自動削除する。繰り返し指定で複数ファイルに対応 | (なし) |
 | `--switchback-shell PATH` | 別チーム提供のスイッチバック用シェルのパス (source で呼び出し) | env: `SWITCHBACK_SHELL` |
 | `--auto-switchback` | ECR 権限が無い場合に自動でスイッチバックして継続する | `false` |
@@ -103,6 +104,28 @@ docker image push <registry>/<repository>:<tag>
 - **安全策**: コピー先に同名ファイルが既に存在する場合は、自動削除で既存ファイルを
   消してしまう事故を防ぐため処理を中止します。
 - `--dry-run` 併用時は、実際のコピー/削除は行わず実行内容のみ表示します。
+
+## ビルドのみの実行 (`--build-only`)
+
+イメージのビルドだけを行い、ECR へのプッシュは行いたくない場合 (ローカルでの
+動作確認、CI でのビルド検証など) は `--build-only` を指定します。
+
+- ECR 権限チェック / ログイン / タグ付け / プッシュ / `imagedefinition.json` の
+  出力はいずれもスキップされ、ビルド完了後に終了します。
+- ECR を操作しないため、`--account-id` / `--registry` や AWS 認証情報は不要です
+  (`aws` コマンドが無くても実行できます)。
+- **`--copy-file` が指定されている場合は、ビルド前に事前ファイルコピーを行った
+  うえでビルドし、ビルド後に自動削除します** (通常時と同じ挙動)。
+
+```bash
+# ビルドのみ (事前ファイルコピーあり)
+./build_and_push.sh --build-only \
+    --copy-file .npmrc:./app \
+    --copy-file certs/ca.pem:./app/certs
+
+# 何が実行されるかだけ確認 (ビルドも行わない)
+./build_and_push.sh --build-only --dry-run
+```
 
 ## push 失敗時の原因診断 / 調査ガイド
 
