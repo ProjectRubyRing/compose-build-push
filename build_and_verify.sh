@@ -1,0 +1,482 @@
+#!/usr/bin/env bash
+#
+# build_and_verify.sh
+# -----------------------------------------------------------------------------
+# 想定実行環境: RHEL 9.6 の EC2 インスタンス (bash / GNU coreutils / Docker CE)。
+#
+# build_and_push.sh の「ビルドのみ実行する処理」を切り出した専用スクリプト。
+# compose.yml で定義したローカルベースイメージ (既定: j1/base.local) を
+# docker compose build でビルドする。ECR ログイン/タグ付け/プッシュ/
+# imagedefinition.json の出力は一切行わない。
+#
+# ビルドに加えて、以下の 2 つの確認を任意で行える:
+#   (1) --verify-startup : ビルドしたイメージをコンテナとして起動し、
+#                          jbosseap (WildFly/JBoss EAP) サーバーの起動完了を
+#                          ログから確認する。
+#   (2) --verify-url URL : 起動確認後、指定 URL へ HTTP リクエストを送り、
+#                          その応答 (ステータスコード/本文) を確認する。
+#
+# --verify-startup / --verify-url いずれも指定しなければ、純粋にビルドのみを
+# 行って終了する (従来の build_and_push.sh --build-only 相当)。
+#
+# 使い方:
+#   # ビルドのみ
+#   ./build_and_verify.sh
+#
+#   # ビルド + jbosseap 起動確認
+#   ./build_and_verify.sh --verify-startup
+#
+#   # ビルド + 起動確認 + URL 応答確認 (例: ヘルスチェックエンドポイント)
+#   ./build_and_verify.sh --verify-startup \
+#       --verify-url http://localhost:8080/health --expect-status 200
+# -----------------------------------------------------------------------------
+
+set -uo pipefail
+
+# ---- 既定値 -----------------------------------------------------------------
+LOCAL_IMAGE="j1/base.local"       # compose build で生成されるローカルベースイメージ名
+COMPOSE_FILE="compose.yml"
+COMPOSE_SERVICE=""                # 指定時はそのサービスのみビルド/起動
+NO_CACHE="false"                  # true: キャッシュを破棄してビルド (--no-cache)
+DRY_RUN="false"                   # true: 実際の変更は行わず、実行内容のプレビューのみ表示
+
+# ビルド前に一時コピーし、ビルド後に自動削除するファイル群
+# COPY_SPECS: "SRC:DEST_DIR" の配列 (--copy-file で繰り返し指定)
+# COPIED_FILES: 実際にコピーしたコピー先ファイルパス (削除対象として記録)
+COPY_SPECS=()
+COPIED_FILES=()
+
+# ---- 起動確認 (jbosseap) 関連 ----------------------------------------------
+VERIFY_STARTUP="false"            # true: ビルド後にコンテナを起動し起動完了を確認
+# 起動完了とみなすログのパターン (拡張正規表現)。
+# 既定は JBoss EAP / WildFly の起動完了メッセージ:
+#   WFLYSRV0025: JBoss EAP x.y.z (WildFly Core ...) started in NNNms
+#   WFLYSRV0026: ... started (with errors) in NNNms
+STARTUP_LOG_PATTERN='WFLYSRV002[56]|JBoss EAP.*started in'
+STARTUP_TIMEOUT="120"             # 起動完了を待つ最大秒数
+STARTUP_INTERVAL="3"              # 起動確認ポーリング間隔 (秒)
+KEEP_CONTAINER="false"            # true: 確認後もコンテナを停止・削除せずに残す
+
+# ---- URL 応答確認 関連 ------------------------------------------------------
+VERIFY_URL=""                     # 空でなければ起動確認後にこの URL を呼び出して確認
+EXPECT_STATUS="200"               # 期待する HTTP ステータスコード
+URL_METHOD="GET"                  # HTTP メソッド
+URL_TIMEOUT="60"                  # URL が期待応答を返すまで待つ最大秒数 (リトライ)
+URL_INTERVAL="3"                  # URL 呼び出しリトライ間隔 (秒)
+URL_INSECURE="false"             # true: TLS 証明書検証を無効化して呼び出す (curl -k)
+
+# ---- ログ用ヘルパ -----------------------------------------------------------
+log()  { printf '[%s] %s\n'  "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+warn() { printf '[%s] [WARN] %s\n'  "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+err()  { printf '[%s] [ERROR] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+# 診断ガイド等の整形出力用 (タイムスタンプ等の接頭辞を付けず、そのまま表示する)
+diag() { printf '%s\n' "$*" >&2; }
+# dry-run 時は実行内容を表示するだけ、通常時はそのままコマンドを実行する。
+run()  {
+  if [ "$DRY_RUN" = "true" ]; then
+    printf '[%s] [DRY-RUN] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+    return 0
+  fi
+  "$@"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: build_and_verify.sh [OPTIONS]
+
+build_and_push.sh の「ビルドのみ」処理を切り出した専用スクリプト。
+compose build でローカルイメージをビルドし、必要に応じて起動確認・URL 応答確認を行う。
+ECR ログイン/タグ付け/プッシュ/imagedefinition.json の出力は行わない。
+
+ビルド関連:
+  --local-image NAME       compose build で生成されるローカルイメージ名 (既定: j1/base.local)
+  --compose-file FILE      compose ファイル (既定: compose.yml)
+  --compose-service NAME   ビルド/起動対象サービス名 (未指定なら全サービス)
+  --no-cache               キャッシュを破棄して compose build する
+  --dry-run                実際のビルド/起動/URL 呼び出し/ファイル操作は行わず、
+                           実行される内容のプレビューのみ表示する
+
+  --copy-file SRC:DEST_DIR ビルド前に SRC を DEST_DIR ディレクトリへコピーし、
+                           処理終了後 (成功・失敗を問わず) に自動削除する。
+                           複数ファイルに対応するため繰り返し指定できる。
+                           例: --copy-file .npmrc:./app --copy-file cert.pem:./app/certs
+                           - DEST_DIR は既存ディレクトリである必要がある
+                           - コピー先に同名ファイルが既存の場合は事故防止のため中止する
+
+起動確認 (jbosseap / WildFly):
+  --verify-startup         ビルド後にコンテナを起動し、jbosseap サーバーの起動完了を
+                           ログから確認する。確認後はコンテナを停止・削除する
+                           (--keep-container 指定時は残す)。
+  --startup-log-pattern P  起動完了とみなすログのパターン (拡張正規表現)。
+                           既定: 'WFLYSRV002[56]|JBoss EAP.*started in'
+  --startup-timeout SEC    起動完了を待つ最大秒数 (既定: 120)
+  --startup-interval SEC   起動確認のポーリング間隔・秒 (既定: 3)
+  --keep-container         確認後もコンテナを停止・削除せずに残す (調査用)
+
+URL 応答確認:
+  --verify-url URL         起動確認後、この URL へ HTTP リクエストを送り応答を確認する。
+                           (単独指定でもコンテナを起動して確認する)
+  --expect-status CODE     期待する HTTP ステータスコード (既定: 200)
+  --url-method METHOD      HTTP メソッド (既定: GET)
+  --url-timeout SEC        期待する応答を得るまで待つ最大秒数・リトライ (既定: 60)
+  --url-interval SEC       URL 呼び出しのリトライ間隔・秒 (既定: 3)
+  --url-insecure           TLS 証明書検証を無効化して呼び出す (curl -k)
+
+  -h, --help               このヘルプを表示
+EOF
+}
+
+# ---- 引数パース -------------------------------------------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --local-image)         LOCAL_IMAGE="$2"; shift 2 ;;
+    --compose-file)        COMPOSE_FILE="$2"; shift 2 ;;
+    --compose-service)     COMPOSE_SERVICE="$2"; shift 2 ;;
+    --no-cache)            NO_CACHE="true"; shift ;;
+    --dry-run)             DRY_RUN="true"; shift ;;
+    --copy-file)           COPY_SPECS+=("$2"); shift 2 ;;
+    --verify-startup)      VERIFY_STARTUP="true"; shift ;;
+    --startup-log-pattern) STARTUP_LOG_PATTERN="$2"; shift 2 ;;
+    --startup-timeout)     STARTUP_TIMEOUT="$2"; shift 2 ;;
+    --startup-interval)    STARTUP_INTERVAL="$2"; shift 2 ;;
+    --keep-container)      KEEP_CONTAINER="true"; shift ;;
+    --verify-url)          VERIFY_URL="$2"; shift 2 ;;
+    --expect-status)       EXPECT_STATUS="$2"; shift 2 ;;
+    --url-method)          URL_METHOD="$2"; shift 2 ;;
+    --url-timeout)         URL_TIMEOUT="$2"; shift 2 ;;
+    --url-interval)        URL_INTERVAL="$2"; shift 2 ;;
+    --url-insecure)        URL_INSECURE="true"; shift ;;
+    -h|--help)             usage; exit 0 ;;
+    *) err "不明なオプション: $1"; usage; exit 2 ;;
+  esac
+done
+
+# --verify-url が指定されている場合、コンテナ起動が前提となる。
+# 明示的に --verify-startup が付いていなくてもコンテナは起動する
+# (起動完了のログ確認を行うかどうかは VERIFY_STARTUP で制御)。
+NEED_CONTAINER="false"
+if [ "$VERIFY_STARTUP" = "true" ] || [ -n "$VERIFY_URL" ]; then
+  NEED_CONTAINER="true"
+fi
+
+# ---- 依存コマンド確認 -------------------------------------------------------
+# ビルドには docker が必須。URL 応答確認を行う場合は curl も必須。
+REQUIRED_CMDS=(docker)
+[ -n "$VERIFY_URL" ] && REQUIRED_CMDS+=(curl)
+for cmd in "${REQUIRED_CMDS[@]}"; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    err "必須コマンドが見つかりません: $cmd"
+    exit 1
+  fi
+done
+
+# docker compose (v2) / docker-compose (v1) の判定
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE_CMD=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE_CMD=(docker-compose)
+else
+  err "docker compose / docker-compose が見つかりません"
+  exit 1
+fi
+
+if [ "$DRY_RUN" = "true" ]; then
+  log "*** DRY-RUN モードです。実際のビルド/起動/URL 呼び出し/ファイル操作は行いません。 ***"
+fi
+
+# ---- ビルド前後の一時ファイルコピー / 自動削除 ------------------------------
+# --copy-file で指定した SRC:DEST_DIR を検証し、SRC を DEST_DIR へコピーする。
+# コピーしたコピー先パスは COPIED_FILES に記録し、EXIT トラップで自動削除する。
+prepare_copy_files() {
+  [ ${#COPY_SPECS[@]} -eq 0 ] && return 0
+  log "ビルド前の一時ファイルコピーを実行します (${#COPY_SPECS[@]} 件) ..."
+  local spec src dest_dir dest
+  for spec in "${COPY_SPECS[@]}"; do
+    # 最初の ':' で SRC と DEST_DIR に分割する (':' が無ければ書式エラー)
+    if [ "${spec%%:*}" = "$spec" ]; then
+      err "--copy-file の書式が不正です: '$spec' (SRC:DEST_DIR 形式で指定してください)"
+      exit 2
+    fi
+    src="${spec%%:*}"
+    dest_dir="${spec#*:}"
+    if [ -z "$src" ] || [ -z "$dest_dir" ]; then
+      err "--copy-file の書式が不正です: '$spec' (SRC / DEST_DIR が空です)"
+      exit 2
+    fi
+    if [ ! -f "$src" ]; then
+      err "コピー元ファイルが見つかりません: $src"
+      exit 1
+    fi
+    if [ ! -d "$dest_dir" ]; then
+      err "コピー先ディレクトリが存在しません: $dest_dir"
+      exit 1
+    fi
+    dest="${dest_dir%/}/$(basename "$src")"
+    # 既存ファイルを上書き→後で削除すると元ファイルを消してしまうため中止する
+    if [ -e "$dest" ]; then
+      err "コピー先に同名ファイルが既に存在します: $dest (自動削除による事故防止のため中止します)"
+      exit 1
+    fi
+    if [ "$DRY_RUN" = "true" ]; then
+      log "[DRY-RUN] cp $src -> $dest (処理後に自動削除)"
+    else
+      if ! cp "$src" "$dest"; then
+        err "ファイルのコピーに失敗しました: $src -> $dest"
+        exit 1
+      fi
+      log "コピーしました: $src -> $dest"
+    fi
+    # dry-run でも記録し、削除プレビューを表示できるようにする
+    COPIED_FILES+=("$dest")
+  done
+}
+
+# コピーしたファイルのみ削除する (EXIT トラップから呼び出す)。
+cleanup_copied_files() {
+  [ ${#COPIED_FILES[@]} -eq 0 ] && return 0
+  log "コピーした一時ファイルを削除します (${#COPIED_FILES[@]} 件) ..."
+  local f
+  for f in "${COPIED_FILES[@]}"; do
+    if [ "$DRY_RUN" = "true" ]; then
+      log "[DRY-RUN] rm -f $f"
+    elif rm -f "$f"; then
+      log "削除しました: $f"
+    else
+      warn "一時ファイルの削除に失敗しました: $f (手動で削除してください)"
+    fi
+  done
+  COPIED_FILES=()
+}
+
+# ---- 起動確認 / URL 確認 用ヘルパ -------------------------------------------
+STARTED_CONTAINER="false"          # コンテナを起動したか (teardown 判定用)
+
+# 対象サービスを引数に含めるための配列 (未指定なら空 = 全サービス扱い)。
+compose_service_args() {
+  if [ -n "$COMPOSE_SERVICE" ]; then
+    printf '%s\n' "$COMPOSE_SERVICE"
+  fi
+}
+
+# 対象コンテナの ID を取得する (複数ある場合は先頭)。
+compose_container_id() {
+  if [ -n "$COMPOSE_SERVICE" ]; then
+    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" ps -q "$COMPOSE_SERVICE" 2>/dev/null | head -n1
+  else
+    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" ps -q 2>/dev/null | head -n1
+  fi
+}
+
+# 対象サービスのログを取得する (スナップショット)。
+compose_logs() {
+  if [ -n "$COMPOSE_SERVICE" ]; then
+    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" logs --no-color "$COMPOSE_SERVICE" 2>&1
+  else
+    "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" logs --no-color 2>&1
+  fi
+}
+
+# コンテナを起動する (バックグラウンド)。
+start_container() {
+  log "コンテナを起動します (compose up -d) ..."
+  local up_args=(-f "$COMPOSE_FILE" up -d --no-build)
+  [ -n "$COMPOSE_SERVICE" ] && up_args+=("$COMPOSE_SERVICE")
+  if ! run "${COMPOSE_CMD[@]}" "${up_args[@]}"; then
+    err "コンテナの起動に失敗しました (compose up)"
+    return 1
+  fi
+  STARTED_CONTAINER="true"
+  return 0
+}
+
+# コンテナを停止・削除する (EXIT トラップから呼び出す)。
+teardown_container() {
+  [ "$STARTED_CONTAINER" = "true" ] || return 0
+  if [ "$KEEP_CONTAINER" = "true" ]; then
+    log "コンテナを残します (--keep-container)。手動で停止する場合: ${COMPOSE_CMD[*]} -f $COMPOSE_FILE down"
+    return 0
+  fi
+  log "コンテナを停止・削除します (compose down) ..."
+  if ! run "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" down; then
+    warn "コンテナの停止・削除に失敗しました。手動で確認してください: ${COMPOSE_CMD[*]} -f $COMPOSE_FILE down"
+  fi
+}
+
+# jbosseap サーバーの起動完了をログから待つ。
+wait_for_startup() {
+  log "jbosseap サーバーの起動完了を確認します (最大 ${STARTUP_TIMEOUT}s, パターン: /${STARTUP_LOG_PATTERN}/) ..."
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] compose logs を ${STARTUP_INTERVAL}s 間隔でポーリングし、上記パターンに一致するまで待ちます。"
+    return 0
+  fi
+  local deadline now cid running logs
+  now="$(date +%s)"
+  deadline=$(( now + STARTUP_TIMEOUT ))
+  while :; do
+    logs="$(compose_logs)"
+    if printf '%s' "$logs" | grep -qE "$STARTUP_LOG_PATTERN"; then
+      log "jbosseap サーバーの起動完了を確認しました。"
+      printf '%s' "$logs" | grep -E "$STARTUP_LOG_PATTERN" | tail -n1 | while IFS= read -r line; do
+        diag "  起動ログ: ${line}"
+      done
+      return 0
+    fi
+    # コンテナが途中で停止していないか確認する (起動失敗の早期検知)。
+    cid="$(compose_container_id)"
+    if [ -n "$cid" ]; then
+      running="$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)"
+      if [ "$running" != "true" ]; then
+        err "コンテナが起動途中で停止しました。jbosseap の起動に失敗した可能性があります。"
+        dump_startup_logs
+        return 1
+      fi
+    fi
+    now="$(date +%s)"
+    if [ "$now" -ge "$deadline" ]; then
+      err "起動確認がタイムアウトしました (${STARTUP_TIMEOUT}s 以内に起動完了ログを検出できませんでした)。"
+      dump_startup_logs
+      return 1
+    fi
+    sleep "$STARTUP_INTERVAL"
+  done
+}
+
+# 失敗時にコンテナログの末尾を出力する (原因調査用)。
+dump_startup_logs() {
+  diag ""
+  diag "───────────────────────────────────────────────────────────────────"
+  diag "コンテナログ (末尾 50 行):"
+  diag "───────────────────────────────────────────────────────────────────"
+  compose_logs | tail -n 50 >&2
+  diag "───────────────────────────────────────────────────────────────────"
+}
+
+# 指定 URL へ HTTP リクエストを送り、期待するステータスコードを確認する。
+verify_url() {
+  log "URL 応答を確認します: [${URL_METHOD}] ${VERIFY_URL} (期待ステータス: ${EXPECT_STATUS}, 最大 ${URL_TIMEOUT}s) ..."
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] curl で ${VERIFY_URL} を ${URL_INTERVAL}s 間隔で呼び出し、ステータス ${EXPECT_STATUS} を確認します。"
+    return 0
+  fi
+
+  local curl_opts=(-s -S -m 30 -o "$URL_BODY_FILE" -w '%{http_code}' -X "$URL_METHOD")
+  [ "$URL_INSECURE" = "true" ] && curl_opts+=(-k)
+
+  local deadline now code last_code=""
+  now="$(date +%s)"
+  deadline=$(( now + URL_TIMEOUT ))
+  while :; do
+    # curl 失敗 (接続不可等) の場合は code が空/000 になるため、|| true で継続する。
+    code="$(curl "${curl_opts[@]}" "$VERIFY_URL" 2>/dev/null || true)"
+    [ -z "$code" ] && code="000"
+    last_code="$code"
+    if [ "$code" = "$EXPECT_STATUS" ]; then
+      log "URL 応答を確認しました: HTTP ${code} (期待通り)。"
+      show_url_body
+      return 0
+    fi
+    now="$(date +%s)"
+    if [ "$now" -ge "$deadline" ]; then
+      err "URL 応答の確認に失敗しました: 最後の応答 HTTP ${last_code} (期待: ${EXPECT_STATUS})。"
+      show_url_body
+      return 1
+    fi
+    log "  HTTP ${code} (期待 ${EXPECT_STATUS} と不一致)。${URL_INTERVAL}s 後に再試行します ..."
+    sleep "$URL_INTERVAL"
+  done
+}
+
+# 直近の URL 応答本文を (先頭のみ) 表示する。
+show_url_body() {
+  [ -f "$URL_BODY_FILE" ] || return 0
+  diag ""
+  diag "───────────────────────────────────────────────────────────────────"
+  diag "URL 応答本文 (先頭 20 行):"
+  diag "───────────────────────────────────────────────────────────────────"
+  head -n 20 "$URL_BODY_FILE" >&2
+  diag "───────────────────────────────────────────────────────────────────"
+}
+
+# ---- 後始末 (コンテナ停止 → 一時ファイル削除 → 応答本文ファイル削除) --------
+URL_BODY_FILE=""
+cleanup_all() {
+  teardown_container
+  cleanup_copied_files
+  [ -n "$URL_BODY_FILE" ] && rm -f "$URL_BODY_FILE"
+}
+# ビルド成功・失敗いずれの経路 (途中の exit を含む) でも確実に後始末する
+trap cleanup_all EXIT
+
+# URL 応答本文の一時ファイル (URL 確認時のみ使用)
+if [ -n "$VERIFY_URL" ]; then
+  URL_BODY_FILE="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/url_body.$$")"
+fi
+
+# ---- ビルド前の一時ファイルコピー -------------------------------------------
+# ここでコピーしたファイルは EXIT トラップ (cleanup_all) により
+# 処理終了後 / 途中終了時のいずれでも自動削除される。
+prepare_copy_files
+
+# ---- ビルド -----------------------------------------------------------------
+BUILD_OPTS=()
+if [ "$NO_CACHE" = "true" ]; then
+  BUILD_OPTS+=(--no-cache)
+  log "キャッシュを破棄して (--no-cache) ビルドします。"
+fi
+
+log "docker compose build を実行します (${COMPOSE_FILE}) ..."
+if [ -n "$COMPOSE_SERVICE" ]; then
+  run "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" build "${BUILD_OPTS[@]}" "$COMPOSE_SERVICE" || { err "compose build に失敗しました"; exit 1; }
+else
+  run "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" build "${BUILD_OPTS[@]}" || { err "compose build に失敗しました"; exit 1; }
+fi
+
+# ローカルベースイメージが生成されたか確認 (dry-run ではビルドしていないためスキップ)
+if [ "$DRY_RUN" = "true" ]; then
+  log "[DRY-RUN] ローカルベースイメージの存在確認をスキップします: $LOCAL_IMAGE"
+elif ! docker image inspect "$LOCAL_IMAGE" >/dev/null 2>&1; then
+  err "ローカルベースイメージが見つかりません: $LOCAL_IMAGE (compose.yml の image 指定を確認してください)"
+  exit 1
+else
+  log "ローカルベースイメージを確認しました: $LOCAL_IMAGE"
+fi
+
+# ---- 起動確認が不要ならここで終了 -------------------------------------------
+if [ "$NEED_CONTAINER" != "true" ]; then
+  if [ "$DRY_RUN" = "true" ]; then
+    log "[DRY-RUN] ビルドのみが完了しました (実際のビルドは行われていません)。"
+  else
+    log "ビルドのみが完了しました。"
+  fi
+  exit 0
+fi
+
+# ---- コンテナ起動 -----------------------------------------------------------
+if ! start_container; then
+  exit 1
+fi
+
+# ---- jbosseap 起動確認 ------------------------------------------------------
+# --verify-startup 指定時はログから起動完了を確認する。
+# (--verify-url のみの場合は起動ログ確認をスキップし、URL のリトライで readiness を担保する)
+if [ "$VERIFY_STARTUP" = "true" ]; then
+  if ! wait_for_startup; then
+    err "起動確認に失敗しました。"
+    exit 1
+  fi
+fi
+
+# ---- URL 応答確認 -----------------------------------------------------------
+if [ -n "$VERIFY_URL" ]; then
+  if ! verify_url; then
+    err "URL 応答確認に失敗しました。"
+    exit 1
+  fi
+fi
+
+if [ "$DRY_RUN" = "true" ]; then
+  log "DRY-RUN が完了しました (実際の変更は行われていません)。"
+else
+  log "ビルドおよび確認が完了しました。"
+fi
+exit 0
