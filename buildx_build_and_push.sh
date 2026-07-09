@@ -40,6 +40,9 @@ BUILD_CONTEXT="."                 # buildx build のビルドコンテキスト
 PLATFORM=""                       # 例: linux/amd64 (--load のため単一プラットフォームのみ)
 BUILDER=""                        # 使用する buildx ビルダー名 (未指定なら現在のビルダー)
 BUILD_ARGS=()                     # --build-arg KEY=VALUE (繰り返し指定可)
+BUILD_CONTEXTS=()                 # --build-context NAME=VALUE (追加のビルドコンテキスト, 繰り返し指定可)
+SECRETS=()                        # --secret id=...,src=... 等 (ビルドシークレット, 繰り返し指定可)
+PROGRESS=""                       # buildx の進捗表示形式 (auto/plain/tty/rawjson)。未指定なら buildx 既定
 NO_CACHE="false"                  # true: キャッシュを破棄してビルド (--no-cache)
 OUTPUT_FILE="imagedefinition.json"
 ECR_USERNAME="AWS"                # ECR ログイン時の固定ユーザー名
@@ -96,6 +99,20 @@ Options:
                            ローカルに --load するため単一プラットフォームのみ指定可
   --builder NAME           使用する buildx ビルダー名 (未指定なら現在のビルダー)
   --build-arg KEY=VALUE    ビルド引数 (繰り返し指定可)
+  --build-context NAME=VALUE
+                           追加のビルドコンテキスト (繰り返し指定可)。
+                           Dockerfile の FROM / COPY --from= で名前参照できる。
+                           VALUE にはローカルディレクトリ / Git URL / イメージ
+                           (docker-image://...) / URL 等を指定できる。
+                           例: --build-context libs=./libs \
+                               --build-context alpine=docker-image://alpine:3.20
+  --secret SPEC            ビルドシークレット (繰り返し指定可)。Dockerfile の
+                           RUN --mount=type=secret,id=... から参照できる。
+                           SPEC は buildx の --secret と同一書式。
+                           例: --secret id=npmrc,src=./.npmrc \
+                               --secret id=token,env=GITHUB_TOKEN
+  --progress MODE          進捗表示形式 (auto/plain/tty/rawjson)。未指定なら buildx 既定。
+                           CI ログには plain が読みやすい
   --no-cache               キャッシュを破棄して buildx build する
 
   --output FILE            imagedefinition の出力先 (既定: imagedefinition.json)
@@ -132,6 +149,9 @@ while [ $# -gt 0 ]; do
     --platform)         PLATFORM="$2"; shift 2 ;;
     --builder)          BUILDER="$2"; shift 2 ;;
     --build-arg)        BUILD_ARGS+=("$2"); shift 2 ;;
+    --build-context)    BUILD_CONTEXTS+=("$2"); shift 2 ;;
+    --secret)           SECRETS+=("$2"); shift 2 ;;
+    --progress)         PROGRESS="$2"; shift 2 ;;
     --no-cache)         NO_CACHE="true"; shift ;;
     --output)           OUTPUT_FILE="$2"; shift 2 ;;
     --dry-run)          DRY_RUN="true"; shift ;;
@@ -164,6 +184,17 @@ if [ -n "$PLATFORM" ] && [ "${PLATFORM#*,}" != "$PLATFORM" ]; then
   err "--platform に複数プラットフォームは指定できません: $PLATFORM"
   err "  (docker image tag / docker image push を使うため --load で単一イメージとして取り込む必要があります)"
   exit 2
+fi
+
+# --progress は buildx が受け付ける形式のみ許可する
+if [ -n "$PROGRESS" ]; then
+  case "$PROGRESS" in
+    auto|plain|tty|rawjson|quiet) ;;
+    *)
+      err "--progress に不正な値が指定されました: $PROGRESS"
+      err "  指定可能な値: auto / plain / tty / rawjson / quiet"
+      exit 2 ;;
+  esac
 fi
 
 # ---- レジストリ URL の組み立て ---------------------------------------------
@@ -537,12 +568,21 @@ fi
 if [ -n "$PLATFORM" ]; then
   BUILDX_OPTS+=(--platform "$PLATFORM")
 fi
+if [ -n "$PROGRESS" ]; then
+  BUILDX_OPTS+=(--progress "$PROGRESS")
+fi
 if [ "$NO_CACHE" = "true" ]; then
   BUILDX_OPTS+=(--no-cache)
   log "キャッシュを破棄して (--no-cache) ビルドします。"
 fi
 for build_arg in ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}; do
   BUILDX_OPTS+=(--build-arg "$build_arg")
+done
+for build_context in ${BUILD_CONTEXTS[@]+"${BUILD_CONTEXTS[@]}"}; do
+  BUILDX_OPTS+=(--build-context "$build_context")
+done
+for secret in ${SECRETS[@]+"${SECRETS[@]}"}; do
+  BUILDX_OPTS+=(--secret "$secret")
 done
 
 log "docker buildx build を実行します (dockerfile=${DOCKERFILE}, context=${BUILD_CONTEXT}) ..."
