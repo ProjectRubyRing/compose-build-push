@@ -62,6 +62,7 @@
 | `--no-cache` | キャッシュを破棄してビルドする | `false` |
 | `--output FILE` | imagedefinition の出力先 | `imagedefinition.json` |
 | `--dry-run` | 実際のビルド/ログイン/タグ付け/プッシュ/ファイル出力は行わず、実行内容のプレビューのみ表示する | `false` |
+| `--log-dir DIR` | コンソールに出力されるログを `DIR` 配下のログファイルにも保存する。画面表示は従来どおり継続し、ログ末尾には処理実行時間 (経過秒数) も記録される。`DIR` が無ければ自動作成する。ファイル名は compose 版が `build_and_push_<YYYYMMDDHHMMSS>.log`、buildx 版が `buildx_build_and_push_<YYYYMMDDHHMMSS>.log`。compose 版で `--build-only` 委譲時も、委譲先 (`build_and_verify.sh`) の出力を含めて記録する | (なし。指定時のみログファイル出力) |
 | `--build-only` | ビルドのみを実行する (**compose 版のみ**。処理は `build_and_verify.sh` に委譲)。ECR 権限チェック/ログイン/タグ付け/プッシュ/`imagedefinition.json` の出力は行わない。`--copy-file` 指定時は事前コピー → ビルド → 自動削除を行う。`--verify-startup` / `--verify-url` 等の追加オプションも委譲される (後述) | `false` |
 | `--copy-file SRC:DEST_DIR` | ビルド前に `SRC` を `DEST_DIR` へコピーし、ビルド終了後に自動削除する。繰り返し指定で複数ファイルに対応 | (なし) |
 | `--switchback-shell PATH` | 別チーム提供のスイッチバック用シェルのパス (source で呼び出し) | env: `SWITCHBACK_SHELL` |
@@ -110,6 +111,34 @@ docker image push <registry>/<repository>:<tag>
 - **安全策**: コピー先に同名ファイルが既に存在する場合は、自動削除で既存ファイルを
   消してしまう事故を防ぐため処理を中止します。
 - `--dry-run` 併用時は、実際のコピー/削除は行わず実行内容のみ表示します。
+
+## ログファイル出力 (`--log-dir`)
+
+`--log-dir DIR` を指定すると、コンソールに出力されるログ (標準出力・標準エラー出力) を
+`DIR` 配下のログファイルにも保存します。画面表示は従来どおり継続するため、対話実行でも
+CI でもそのまま利用できます。compose 版 (`build_and_push.sh`) / buildx 版
+(`buildx_build_and_push.sh`) の両方で使えます。
+
+```bash
+# compose 版
+./build_and_push.sh --account-id 123456789012 \
+    --log-dir ./build-logs
+#  => ./build-logs/build_and_push_20260702153000.log にログを保存
+
+# buildx 版
+./buildx_build_and_push.sh --account-id 123456789012 \
+    --log-dir ./build-logs
+#  => ./build-logs/buildx_build_and_push_20260702153000.log にログを保存
+```
+
+- ファイル名は `<スクリプト名>_<YYYYMMDDHHMMSS>.log` (実行開始時刻) です。
+- `DIR` が存在しない場合は `mkdir -p` で自動作成します。
+- 標準出力と標準エラー出力を同一の `tee` にまとめるため、ログの時系列順が保たれます。
+- ログの末尾には、ビルド成功・失敗・途中終了のいずれの場合でも **処理実行時間**
+  (経過秒数と `HH:MM:SS` 形式) が記録されます。
+- `--dry-run` 併用時も、プレビュー出力がそのままログファイルへ保存されます。
+- compose 版で `--build-only` を併用した場合も、委譲先 (`build_and_verify.sh`) の
+  出力を含めてログファイルへ記録します。
 
 ## ビルドのみの実行 / 起動・URL 確認 (`build_and_verify.sh`)
 
