@@ -9,6 +9,8 @@
 # imagedefinition.json を出力する。
 #
 # 権限まわりの前提:
+#   - スクリプト開始時に、事前に aws login --remote による認証操作が実行されて
+#     いるかをチェックし、未認証の場合は認証を促す警告を出して終了する (exit 1)。
 #   - このステージでは CodeCommit の操作は不要。ECR の操作権限のみが必要。
 #   - 現在の操作権限で ECR を操作できない場合の挙動を 2 通りから選べる:
 #       (A) 既定 (--warn-only)  : スイッチバックを促す警告を出して終了 (exit 1)
@@ -17,8 +19,18 @@
 #                                    してから処理を継続する。
 #   - スイッチバック用シェルの配置場所は --switchback-shell で指定可能。
 #
+# JBoss マスターパスワード (BuildKit シークレット):
+#   - ビルド前に、パラメータストアの指定キー (--jboss-password-param) から
+#     JBoss のマスターパスワードを取得できる。パラメータストアから取得せず
+#     直接渡す (--jboss-password) ことも可能。
+#   - 取得したマスターパスワードは環境変数 (--jboss-password-env, 既定:
+#     JBOSS_MASTER_PASSWORD) へ export し、compose.yml の environment 型
+#     シークレット定義を通じて BuildKit シークレットとして安全にビルドへ
+#     注入する (イメージのレイヤや履歴には残らない)。
+#
 # 使い方:
 #   ./build_and_push.sh --account-id 123456789012 --region ap-northeast-1 \
+#       --jboss-password-param /j1/jboss/master-password \
 #       --auto-switchback --switchback-shell /opt/team/switchback.sh
 # -----------------------------------------------------------------------------
 
@@ -55,6 +67,13 @@ COPIED_FILES=()
 # スイッチバック関連
 SWITCHBACK_SHELL="${SWITCHBACK_SHELL:-}"
 AUTO_SWITCHBACK="false"           # false: 警告して終了 / true: 自動スイッチバック
+
+# JBoss マスターパスワード (BuildKit シークレット) 関連
+JBOSS_PASSWORD_PARAM=""           # パラメータストアのキー名 (--jboss-password-param)
+JBOSS_PASSWORD_VALUE=""           # 直接指定されたマスターパスワード (--jboss-password)
+JBOSS_PASSWORD_ENV="JBOSS_MASTER_PASSWORD"  # シークレット受け渡しに使う環境変数名
+JBOSS_PASSWORD_ENV_SET="false"    # --jboss-password-env が明示指定されたか
+JBOSS_SECRET_ENABLED="false"      # マスターパスワードをビルドシークレットとして注入するか
 
 # ---- ログ用ヘルパ -----------------------------------------------------------
 # スクリプト開始時刻 (処理実行時間の算出に使用)
@@ -126,11 +145,35 @@ Options:
                            - DEST_DIR は既存ディレクトリである必要がある
                            - コピー先に同名ファイルが既存の場合は事故防止のため中止する
 
+  --jboss-password-param NAME
+                           JBoss のマスターパスワードを AWS パラメータストア
+                           (SSM Parameter Store) の指定キー NAME から取得する
+                           (aws ssm get-parameter --with-decryption)。
+                           取得した値は --jboss-password-env の環境変数へ export され、
+                           compose.yml の environment 型シークレット定義を通じて
+                           BuildKit シークレットとしてビルドに注入される。
+  --jboss-password VALUE   JBoss のマスターパスワードを直接指定する
+                           (パラメータストアから取得しない場合)。
+                           --jboss-password-param とは同時に指定できない。
+                           ※ コマンドライン (ps / シェル履歴) に平文が残るため、
+                             可能なら --jboss-password-param か、事前 export +
+                             --jboss-password-env の利用を推奨。
+  --jboss-password-env NAME
+                           シークレットの受け渡しに使う環境変数名
+                           (既定: JBOSS_MASTER_PASSWORD)。compose.yml の
+                           secrets の environment: と一致させること。
+                           このオプションのみを指定した場合は、事前に export
+                           済みの環境変数の値をそのままパスワードとして使う。
+
   --switchback-shell PATH  別チーム提供のスイッチバック用シェルのパス (source で呼び出し)
   --auto-switchback        ECR 権限が無い場合に自動でスイッチバックして継続する
   --warn-only              ECR 権限が無い場合に警告して終了する (既定)
 
   -h, --help               このヘルプを表示
+
+備考:
+  スクリプト開始時に AWS 認証 (aws login --remote 実施済みか) を確認し、
+  未認証の場合は認証を促す警告を表示して終了する (exit 1)。
 EOF
 }
 
@@ -211,6 +254,9 @@ while [ $# -gt 0 ]; do
     --dry-run)          DRY_RUN="true"; shift ;;
     --build-only)       shift ;;  # 冒頭で build_and_verify.sh に委譲済み (ここには到達しない)
     --copy-file)        COPY_SPECS+=("$2"); shift 2 ;;
+    --jboss-password-param) JBOSS_PASSWORD_PARAM="$2"; shift 2 ;;
+    --jboss-password)       JBOSS_PASSWORD_VALUE="$2"; shift 2 ;;
+    --jboss-password-env)   JBOSS_PASSWORD_ENV="$2"; JBOSS_PASSWORD_ENV_SET="true"; shift 2 ;;
     --switchback-shell) SWITCHBACK_SHELL="$2"; shift 2 ;;
     --auto-switchback)  AUTO_SWITCHBACK="true"; shift ;;
     --warn-only)        AUTO_SWITCHBACK="false"; shift ;;
@@ -224,6 +270,21 @@ done
 # 出力されない。後段で一時ファイル削除も伴うトラップに差し替える。
 trap log_elapsed EXIT
 
+# ---- JBoss マスターパスワード関連オプションの検証 ----------------------------
+# 取得元はパラメータストア (--jboss-password-param) / 直接指定 (--jboss-password) /
+# 事前 export 済み環境変数 (--jboss-password-env のみ指定) のいずれか 1 つ。
+if [ -n "$JBOSS_PASSWORD_PARAM" ] && [ -n "$JBOSS_PASSWORD_VALUE" ]; then
+  err "--jboss-password-param と --jboss-password は同時に指定できません (どちらか一方を指定してください)"
+  exit 2
+fi
+if [ -n "$JBOSS_PASSWORD_PARAM" ] || [ -n "$JBOSS_PASSWORD_VALUE" ] || [ "$JBOSS_PASSWORD_ENV_SET" = "true" ]; then
+  JBOSS_SECRET_ENABLED="true"
+fi
+if ! printf '%s' "$JBOSS_PASSWORD_ENV" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
+  err "--jboss-password-env に不正な環境変数名が指定されました: $JBOSS_PASSWORD_ENV"
+  exit 2
+fi
+
 # ---- 依存コマンド確認 -------------------------------------------------------
 # ECR へプッシュするため docker と aws が必須。
 REQUIRED_CMDS=(docker aws)
@@ -233,6 +294,21 @@ for cmd in "${REQUIRED_CMDS[@]}"; do
     exit 1
   fi
 done
+
+# ---- AWS 認証 (aws login --remote) 済みかのチェック --------------------------
+# スクリプト実行開始時に、事前に aws login --remote による認証操作が実行されて
+# いるかを sts get-caller-identity で確認する。未認証なら認証を促して終了する。
+log "AWS 認証状態を確認します (aws login --remote 実施済みか) ..."
+if aws sts get-caller-identity >/dev/null 2>&1; then
+  log "AWS 認証を確認しました。"
+elif [ "$DRY_RUN" = "true" ]; then
+  warn "AWS 認証が確認できませんが、DRY-RUN のため中止せずにプレビューを継続します。"
+  warn "  実際に実行する場合は、事前に 'aws login --remote' で認証してください。"
+else
+  err "AWS 認証が確認できません (aws sts get-caller-identity に失敗)。未認証の状態です。"
+  err "  事前に 'aws login --remote' を実行して認証してから、再実行してください。"
+  exit 1
+fi
 
 # docker compose (v2) / docker-compose (v1) の判定
 if docker compose version >/dev/null 2>&1; then
@@ -286,6 +362,56 @@ do_switchback() {
   # shellcheck disable=SC1090
   source "$SWITCHBACK_SHELL"
   return 0
+}
+
+# ---- JBoss マスターパスワードの取得 / BuildKit シークレット注入準備 ----------
+# --jboss-password-param / --jboss-password / --jboss-password-env のいずれかが
+# 指定された場合に、マスターパスワードを取得して環境変数へ export する。
+# compose.yml 側で secrets の environment: に同じ環境変数名を定義しておくことで、
+# BuildKit シークレット (RUN --mount=type=secret) としてビルドから参照できる。
+# パスワードの値そのものは、ログにもコマンドラインにも出力しない。
+prepare_jboss_password() {
+  [ "$JBOSS_SECRET_ENABLED" = "true" ] || return 0
+  local password=""
+  if [ -n "$JBOSS_PASSWORD_PARAM" ]; then
+    log "パラメータストアから JBoss マスターパスワードを取得します: ${JBOSS_PASSWORD_PARAM} (region=${REGION}) ..."
+    if [ "$DRY_RUN" = "true" ]; then
+      log "[DRY-RUN] aws ssm get-parameter --name ${JBOSS_PASSWORD_PARAM} --with-decryption --region ${REGION} (値の取得・表示は行いません)"
+    else
+      local ssm_errfile
+      ssm_errfile="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/ssm_err.$$")"
+      if ! password="$(aws ssm get-parameter --name "$JBOSS_PASSWORD_PARAM" \
+            --with-decryption --region "$REGION" \
+            --query 'Parameter.Value' --output text 2>"$ssm_errfile")"; then
+        err "パラメータストアからの取得に失敗しました: ${JBOSS_PASSWORD_PARAM}"
+        sed 's/^/  /' "$ssm_errfile" >&2
+        rm -f "$ssm_errfile"
+        err "  パラメータ名 / リージョン (${REGION}) / ssm:GetParameter 権限を確認してください。"
+        exit 1
+      fi
+      rm -f "$ssm_errfile"
+      if [ -z "$password" ] || [ "$password" = "None" ]; then
+        err "パラメータストアから取得した値が空です: ${JBOSS_PASSWORD_PARAM}"
+        exit 1
+      fi
+      log "パラメータストアから取得しました (値はログに出力しません)。"
+    fi
+  elif [ -n "$JBOSS_PASSWORD_VALUE" ]; then
+    log "直接指定された JBoss マスターパスワードを使用します (値はログに出力しません)。"
+    password="$JBOSS_PASSWORD_VALUE"
+  else
+    # --jboss-password-env のみ指定: 事前に export 済みの環境変数の値をそのまま使う
+    password="${!JBOSS_PASSWORD_ENV:-}"
+    if [ -z "$password" ] && [ "$DRY_RUN" != "true" ]; then
+      err "環境変数 ${JBOSS_PASSWORD_ENV} が未設定または空です。"
+      err "  --jboss-password-param / --jboss-password で渡すか、事前に export してから再実行してください。"
+      exit 1
+    fi
+    log "既存の環境変数 ${JBOSS_PASSWORD_ENV} の値を JBoss マスターパスワードとして使用します。"
+  fi
+  export "${JBOSS_PASSWORD_ENV}=${password}"
+  log "JBoss マスターパスワードを環境変数 ${JBOSS_PASSWORD_ENV} 経由で BuildKit シークレットとして注入します。"
+  log "  (compose.yml の secrets で environment: ${JBOSS_PASSWORD_ENV} を定義しておくこと)"
 }
 
 # ---- ビルド前後の一時ファイルコピー / 自動削除 ------------------------------
@@ -590,6 +716,15 @@ if { log "ECR 操作権限を確認します (region=${REGION}) ..."; ! check_ec
     exit 1
   fi
 fi
+
+# ---- JBoss マスターパスワードの取得 / シークレット注入準備 -------------------
+# パラメータストアへのアクセスに AWS 権限が必要なため、スイッチバック確定後に行う。
+prepare_jboss_password
+
+# compose.yml の environment 型シークレット (既定: JBOSS_MASTER_PASSWORD) は、
+# 環境変数が未定義だと compose build が失敗するため、シークレットを使わない
+# 場合でも空文字で定義しておく (既に値が入っていればそのまま維持する)。
+export JBOSS_MASTER_PASSWORD="${JBOSS_MASTER_PASSWORD:-}"
 
 # ---- ビルド前の一時ファイルコピー -------------------------------------------
 # ここでコピーしたファイルは EXIT トラップ (cleanup_copied_files) により
