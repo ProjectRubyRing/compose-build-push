@@ -12,6 +12,8 @@
 # を実行して、結果として imagedefinition.json を出力する。
 #
 # 権限まわりの前提 (build_and_push.sh と同じ):
+#   - スクリプト開始時に、事前に aws login --remote による認証操作が実行されて
+#     いるかをチェックし、未認証の場合は認証を促す警告を出して終了する (exit 1)。
 #   - このステージでは CodeCommit の操作は不要。ECR の操作権限のみが必要。
 #   - 現在の操作権限で ECR を操作できない場合の挙動を 2 通りから選べる:
 #       (A) 既定 (--warn-only)  : スイッチバックを促す警告を出して終了 (exit 1)
@@ -20,8 +22,18 @@
 #                                    してから処理を継続する。
 #   - スイッチバック用シェルの配置場所は --switchback-shell で指定可能。
 #
+# JBoss マスターパスワード (BuildKit シークレット):
+#   - buildx build の前に、パラメータストアの指定キー (--jboss-password-param)
+#     から JBoss のマスターパスワードを取得できる。パラメータストアから取得せず
+#     直接渡す (--jboss-password) ことも可能。
+#   - 取得したマスターパスワードは環境変数 (--jboss-password-env, 既定:
+#     JBOSS_MASTER_PASSWORD) へ export し、buildx の
+#     --secret id=<id>,env=<環境変数名> (environment 型シークレット) として
+#     安全にビルドへ注入する (イメージのレイヤや履歴には残らない)。
+#
 # 使い方:
 #   ./buildx_build_and_push.sh --account-id 123456789012 --region ap-northeast-1 \
+#       --jboss-password-param /j1/jboss/master-password \
 #       --auto-switchback --switchback-shell /opt/team/switchback.sh
 # -----------------------------------------------------------------------------
 
@@ -40,10 +52,14 @@ BUILD_CONTEXT="."                 # buildx build のビルドコンテキスト
 PLATFORM=""                       # 例: linux/amd64 (--load のため単一プラットフォームのみ)
 BUILDER=""                        # 使用する buildx ビルダー名 (未指定なら現在のビルダー)
 BUILD_ARGS=()                     # --build-arg KEY=VALUE (繰り返し指定可)
+BUILD_CONTEXTS=()                 # --build-context NAME=VALUE (追加のビルドコンテキスト, 繰り返し指定可)
+SECRETS=()                        # --secret id=...,src=... 等 (ビルドシークレット, 繰り返し指定可)
+PROGRESS=""                       # buildx の進捗表示形式 (auto/plain/tty/rawjson)。未指定なら buildx 既定
 NO_CACHE="false"                  # true: キャッシュを破棄してビルド (--no-cache)
 OUTPUT_FILE="imagedefinition.json"
 ECR_USERNAME="AWS"                # ECR ログイン時の固定ユーザー名
 DRY_RUN="false"                   # true: 実際の変更は行わず、実行内容のプレビューのみ表示
+LOG_DIR=""                        # 指定時: コンソール出力をこのディレクトリのログファイルにも保存する
 
 # ビルド前に一時コピーし、ビルド後に自動削除するファイル群
 # COPY_SPECS: "SRC:DEST_DIR" の配列 (--copy-file で繰り返し指定)
@@ -55,7 +71,17 @@ COPIED_FILES=()
 SWITCHBACK_SHELL="${SWITCHBACK_SHELL:-}"
 AUTO_SWITCHBACK="false"           # false: 警告して終了 / true: 自動スイッチバック
 
+# JBoss マスターパスワード (BuildKit シークレット) 関連
+JBOSS_PASSWORD_PARAM=""           # パラメータストアのキー名 (--jboss-password-param)
+JBOSS_PASSWORD_VALUE=""           # 直接指定されたマスターパスワード (--jboss-password)
+JBOSS_PASSWORD_ENV="JBOSS_MASTER_PASSWORD"  # シークレット受け渡しに使う環境変数名
+JBOSS_PASSWORD_ENV_SET="false"    # --jboss-password-env が明示指定されたか
+JBOSS_SECRET_ID="jboss_master_password"     # buildx --secret の id (Dockerfile から参照する名前)
+JBOSS_SECRET_ENABLED="false"      # マスターパスワードをビルドシークレットとして注入するか
+
 # ---- ログ用ヘルパ -----------------------------------------------------------
+# スクリプト開始時刻 (処理実行時間の算出に使用)
+START_EPOCH="$(date +%s)"
 log()  { printf '[%s] %s\n'  "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 warn() { printf '[%s] [WARN] %s\n'  "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
 err()  { printf '[%s] [ERROR] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
@@ -68,6 +94,16 @@ run()  {
     return 0
   fi
   "$@"
+}
+
+# 開始時刻からの経過時間 (処理実行時間) を人間可読な形式でログ出力する。
+# EXIT トラップから呼ばれるため、成功・失敗いずれの経路でも記録される。
+log_elapsed() {
+  local end_epoch elapsed
+  end_epoch="$(date +%s)"
+  elapsed=$(( end_epoch - START_EPOCH ))
+  log "処理実行時間: ${elapsed} 秒 ($(printf '%02d:%02d:%02d' \
+      "$(( elapsed / 3600 ))" "$(( (elapsed % 3600) / 60 ))" "$(( elapsed % 60 ))"))"
 }
 
 usage() {
@@ -96,9 +132,28 @@ Options:
                            ローカルに --load するため単一プラットフォームのみ指定可
   --builder NAME           使用する buildx ビルダー名 (未指定なら現在のビルダー)
   --build-arg KEY=VALUE    ビルド引数 (繰り返し指定可)
+  --build-context NAME=VALUE
+                           追加のビルドコンテキスト (繰り返し指定可)。
+                           Dockerfile の FROM / COPY --from= で名前参照できる。
+                           VALUE にはローカルディレクトリ / Git URL / イメージ
+                           (docker-image://...) / URL 等を指定できる。
+                           例: --build-context libs=./libs \
+                               --build-context alpine=docker-image://alpine:3.20
+  --secret SPEC            ビルドシークレット (繰り返し指定可)。Dockerfile の
+                           RUN --mount=type=secret,id=... から参照できる。
+                           SPEC は buildx の --secret と同一書式。
+                           例: --secret id=npmrc,src=./.npmrc \
+                               --secret id=token,env=GITHUB_TOKEN
+  --progress MODE          進捗表示形式 (auto/plain/tty/rawjson)。未指定なら buildx 既定。
+                           CI ログには plain が読みやすい
   --no-cache               キャッシュを破棄して buildx build する
 
   --output FILE            imagedefinition の出力先 (既定: imagedefinition.json)
+  --log-dir DIR            コンソールに出力されるログを、DIR 配下のログファイルにも
+                           保存する (画面表示は従来どおり継続)。ログ末尾には処理実行
+                           時間 (経過秒数) も記録される。
+                           - DIR が存在しない場合は自動作成する (mkdir -p)
+                           - ファイル名は buildx_build_and_push_<YYYYMMDDHHMMSS>.log
   --dry-run                実際のビルド/ログイン/タグ付け/プッシュ/ファイル出力は
                            行わず、実行される内容のプレビューのみ表示する
 
@@ -109,11 +164,37 @@ Options:
                            - DEST_DIR は既存ディレクトリである必要がある
                            - コピー先に同名ファイルが既存の場合は事故防止のため中止する
 
+  --jboss-password-param NAME
+                           JBoss のマスターパスワードを AWS パラメータストア
+                           (SSM Parameter Store) の指定キー NAME から取得する
+                           (aws ssm get-parameter --with-decryption)。
+                           取得した値は --jboss-password-env の環境変数へ export され、
+                           buildx の --secret id=<id>,env=<環境変数名> として
+                           BuildKit シークレット注入される。Dockerfile からは
+                           RUN --mount=type=secret,id=<id> で参照できる。
+  --jboss-password VALUE   JBoss のマスターパスワードを直接指定する
+                           (パラメータストアから取得しない場合)。
+                           --jboss-password-param とは同時に指定できない。
+                           ※ コマンドライン (ps / シェル履歴) に平文が残るため、
+                             可能なら --jboss-password-param か、事前 export +
+                             --jboss-password-env の利用を推奨。
+  --jboss-password-env NAME
+                           シークレットの受け渡しに使う環境変数名
+                           (既定: JBOSS_MASTER_PASSWORD)。
+                           このオプションのみを指定した場合は、事前に export
+                           済みの環境変数の値をそのままパスワードとして使う。
+  --jboss-secret-id ID     BuildKit シークレットの id (既定: jboss_master_password)。
+                           Dockerfile の RUN --mount=type=secret,id=... と一致させる。
+
   --switchback-shell PATH  別チーム提供のスイッチバック用シェルのパス (source で呼び出し)
   --auto-switchback        ECR 権限が無い場合に自動でスイッチバックして継続する
   --warn-only              ECR 権限が無い場合に警告して終了する (既定)
 
   -h, --help               このヘルプを表示
+
+備考:
+  スクリプト開始時に AWS 認証 (aws login --remote 実施済みか) を確認し、
+  未認証の場合は認証を促す警告を表示して終了する (exit 1)。
 EOF
 }
 
@@ -132,10 +213,18 @@ while [ $# -gt 0 ]; do
     --platform)         PLATFORM="$2"; shift 2 ;;
     --builder)          BUILDER="$2"; shift 2 ;;
     --build-arg)        BUILD_ARGS+=("$2"); shift 2 ;;
+    --build-context)    BUILD_CONTEXTS+=("$2"); shift 2 ;;
+    --secret)           SECRETS+=("$2"); shift 2 ;;
+    --progress)         PROGRESS="$2"; shift 2 ;;
     --no-cache)         NO_CACHE="true"; shift ;;
     --output)           OUTPUT_FILE="$2"; shift 2 ;;
+    --log-dir)          LOG_DIR="$2"; shift 2 ;;
     --dry-run)          DRY_RUN="true"; shift ;;
     --copy-file)        COPY_SPECS+=("$2"); shift 2 ;;
+    --jboss-password-param) JBOSS_PASSWORD_PARAM="$2"; shift 2 ;;
+    --jboss-password)       JBOSS_PASSWORD_VALUE="$2"; shift 2 ;;
+    --jboss-password-env)   JBOSS_PASSWORD_ENV="$2"; JBOSS_PASSWORD_ENV_SET="true"; shift 2 ;;
+    --jboss-secret-id)      JBOSS_SECRET_ID="$2"; shift 2 ;;
     --switchback-shell) SWITCHBACK_SHELL="$2"; shift 2 ;;
     --auto-switchback)  AUTO_SWITCHBACK="true"; shift ;;
     --warn-only)        AUTO_SWITCHBACK="false"; shift ;;
@@ -143,6 +232,45 @@ while [ $# -gt 0 ]; do
     *) err "不明なオプション: $1"; usage; exit 2 ;;
   esac
 done
+
+# ---- ログファイル出力の準備 -------------------------------------------------
+# --log-dir 指定時は、以降のコンソール出力 (stdout/stderr) を tee でログファイルへ
+# 複製する。画面表示はそのまま継続し、時系列の順序を保つため stdout/stderr を
+# 同一の tee にまとめる。処理実行時間は EXIT トラップの log_elapsed で末尾に記録する。
+if [ -n "$LOG_DIR" ]; then
+  if ! mkdir -p "$LOG_DIR"; then
+    err "ログ出力先ディレクトリを作成できませんでした: $LOG_DIR"
+    exit 1
+  fi
+  LOG_FILE="${LOG_DIR%/}/buildx_build_and_push_$(date '+%Y%m%d%H%M%S').log"
+  # 以降の全出力を tee で LOG_FILE にも書き込む (画面にも出力)
+  exec > >(tee -a "$LOG_FILE") 2>&1
+  log "コンソール出力をログファイルにも保存します: $LOG_FILE"
+fi
+
+# 引数パース以降のどの経路 (途中の exit を含む) でも処理実行時間を記録する。
+# 後段で一時ファイル削除も伴うトラップに差し替えるが、それより前の early-exit
+# (依存コマンド不足など) でも経過時間が残るよう、ここで先に仕掛けておく。
+trap log_elapsed EXIT
+
+# ---- JBoss マスターパスワード関連オプションの検証 ----------------------------
+# 取得元はパラメータストア (--jboss-password-param) / 直接指定 (--jboss-password) /
+# 事前 export 済み環境変数 (--jboss-password-env のみ指定) のいずれか 1 つ。
+if [ -n "$JBOSS_PASSWORD_PARAM" ] && [ -n "$JBOSS_PASSWORD_VALUE" ]; then
+  err "--jboss-password-param と --jboss-password は同時に指定できません (どちらか一方を指定してください)"
+  exit 2
+fi
+if [ -n "$JBOSS_PASSWORD_PARAM" ] || [ -n "$JBOSS_PASSWORD_VALUE" ] || [ "$JBOSS_PASSWORD_ENV_SET" = "true" ]; then
+  JBOSS_SECRET_ENABLED="true"
+fi
+if ! printf '%s' "$JBOSS_PASSWORD_ENV" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
+  err "--jboss-password-env に不正な環境変数名が指定されました: $JBOSS_PASSWORD_ENV"
+  exit 2
+fi
+if [ -z "$JBOSS_SECRET_ID" ]; then
+  err "--jboss-secret-id に空の値は指定できません"
+  exit 2
+fi
 
 # ---- 依存コマンド確認 -------------------------------------------------------
 for cmd in aws docker; do
@@ -159,11 +287,37 @@ if ! docker buildx version >/dev/null 2>&1; then
   exit 1
 fi
 
+# ---- AWS 認証 (aws login --remote) 済みかのチェック --------------------------
+# スクリプト実行開始時に、事前に aws login --remote による認証操作が実行されて
+# いるかを sts get-caller-identity で確認する。未認証なら認証を促して終了する。
+log "AWS 認証状態を確認します (aws login --remote 実施済みか) ..."
+if aws sts get-caller-identity >/dev/null 2>&1; then
+  log "AWS 認証を確認しました。"
+elif [ "$DRY_RUN" = "true" ]; then
+  warn "AWS 認証が確認できませんが、DRY-RUN のため中止せずにプレビューを継続します。"
+  warn "  実際に実行する場合は、事前に 'aws login --remote' で認証してください。"
+else
+  err "AWS 認証が確認できません (aws sts get-caller-identity に失敗)。未認証の状態です。"
+  err "  事前に 'aws login --remote' を実行して認証してから、再実行してください。"
+  exit 1
+fi
+
 # --load で docker イメージストアに取り込むため、単一プラットフォームのみ許可する
 if [ -n "$PLATFORM" ] && [ "${PLATFORM#*,}" != "$PLATFORM" ]; then
   err "--platform に複数プラットフォームは指定できません: $PLATFORM"
   err "  (docker image tag / docker image push を使うため --load で単一イメージとして取り込む必要があります)"
   exit 2
+fi
+
+# --progress は buildx が受け付ける形式のみ許可する
+if [ -n "$PROGRESS" ]; then
+  case "$PROGRESS" in
+    auto|plain|tty|rawjson|quiet) ;;
+    *)
+      err "--progress に不正な値が指定されました: $PROGRESS"
+      err "  指定可能な値: auto / plain / tty / rawjson / quiet"
+      exit 2 ;;
+  esac
 fi
 
 # ---- レジストリ URL の組み立て ---------------------------------------------
@@ -208,6 +362,55 @@ do_switchback() {
   # shellcheck disable=SC1090
   source "$SWITCHBACK_SHELL"
   return 0
+}
+
+# ---- JBoss マスターパスワードの取得 / BuildKit シークレット注入準備 ----------
+# --jboss-password-param / --jboss-password / --jboss-password-env のいずれかが
+# 指定された場合に、マスターパスワードを取得して環境変数へ export する。
+# buildx build には --secret id=<JBOSS_SECRET_ID>,env=<環境変数名> として渡し、
+# Dockerfile からは RUN --mount=type=secret,id=<JBOSS_SECRET_ID> で参照する。
+# パスワードの値そのものは、ログにもコマンドラインにも出力しない。
+prepare_jboss_password() {
+  [ "$JBOSS_SECRET_ENABLED" = "true" ] || return 0
+  local password=""
+  if [ -n "$JBOSS_PASSWORD_PARAM" ]; then
+    log "パラメータストアから JBoss マスターパスワードを取得します: ${JBOSS_PASSWORD_PARAM} (region=${REGION}) ..."
+    if [ "$DRY_RUN" = "true" ]; then
+      log "[DRY-RUN] aws ssm get-parameter --name ${JBOSS_PASSWORD_PARAM} --with-decryption --region ${REGION} (値の取得・表示は行いません)"
+    else
+      local ssm_errfile
+      ssm_errfile="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/ssm_err.$$")"
+      if ! password="$(aws ssm get-parameter --name "$JBOSS_PASSWORD_PARAM" \
+            --with-decryption --region "$REGION" \
+            --query 'Parameter.Value' --output text 2>"$ssm_errfile")"; then
+        err "パラメータストアからの取得に失敗しました: ${JBOSS_PASSWORD_PARAM}"
+        sed 's/^/  /' "$ssm_errfile" >&2
+        rm -f "$ssm_errfile"
+        err "  パラメータ名 / リージョン (${REGION}) / ssm:GetParameter 権限を確認してください。"
+        exit 1
+      fi
+      rm -f "$ssm_errfile"
+      if [ -z "$password" ] || [ "$password" = "None" ]; then
+        err "パラメータストアから取得した値が空です: ${JBOSS_PASSWORD_PARAM}"
+        exit 1
+      fi
+      log "パラメータストアから取得しました (値はログに出力しません)。"
+    fi
+  elif [ -n "$JBOSS_PASSWORD_VALUE" ]; then
+    log "直接指定された JBoss マスターパスワードを使用します (値はログに出力しません)。"
+    password="$JBOSS_PASSWORD_VALUE"
+  else
+    # --jboss-password-env のみ指定: 事前に export 済みの環境変数の値をそのまま使う
+    password="${!JBOSS_PASSWORD_ENV:-}"
+    if [ -z "$password" ] && [ "$DRY_RUN" != "true" ]; then
+      err "環境変数 ${JBOSS_PASSWORD_ENV} が未設定または空です。"
+      err "  --jboss-password-param / --jboss-password で渡すか、事前に export してから再実行してください。"
+      exit 1
+    fi
+    log "既存の環境変数 ${JBOSS_PASSWORD_ENV} の値を JBoss マスターパスワードとして使用します。"
+  fi
+  export "${JBOSS_PASSWORD_ENV}=${password}"
+  log "JBoss マスターパスワードを環境変数 ${JBOSS_PASSWORD_ENV} 経由で BuildKit シークレット (id=${JBOSS_SECRET_ID}) として注入します。"
 }
 
 # ---- ビルド前後の一時ファイルコピー / 自動削除 ------------------------------
@@ -273,8 +476,9 @@ cleanup_copied_files() {
   done
   COPIED_FILES=()
 }
-# ビルド成功・失敗いずれの経路 (途中の exit を含む) でも確実に削除する
-trap cleanup_copied_files EXIT
+# ビルド成功・失敗いずれの経路 (途中の exit を含む) でも確実に削除する。
+# 併せて処理実行時間 (経過秒数) を末尾に記録する。
+trap 'cleanup_copied_files; log_elapsed' EXIT
 
 # ---- docker push 失敗時の原因診断 / 調査ガイド ------------------------------
 # 各原因カテゴリごとの詳細な説明・AWS CLI 調査コマンド・AWS コンソール確認箇所を出力する。
@@ -513,6 +717,10 @@ if ! check_ecr_permission; then
   fi
 fi
 
+# ---- JBoss マスターパスワードの取得 / シークレット注入準備 -------------------
+# パラメータストアへのアクセスに AWS 権限が必要なため、スイッチバック確定後に行う。
+prepare_jboss_password
+
 # ---- ビルド前の一時ファイルコピー -------------------------------------------
 # ここでコピーしたファイルは EXIT トラップ (cleanup_copied_files) により
 # ビルド終了後 / 途中終了時のいずれでも自動削除される。
@@ -537,6 +745,9 @@ fi
 if [ -n "$PLATFORM" ]; then
   BUILDX_OPTS+=(--platform "$PLATFORM")
 fi
+if [ -n "$PROGRESS" ]; then
+  BUILDX_OPTS+=(--progress "$PROGRESS")
+fi
 if [ "$NO_CACHE" = "true" ]; then
   BUILDX_OPTS+=(--no-cache)
   log "キャッシュを破棄して (--no-cache) ビルドします。"
@@ -544,6 +755,18 @@ fi
 for build_arg in ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}; do
   BUILDX_OPTS+=(--build-arg "$build_arg")
 done
+for build_context in ${BUILD_CONTEXTS[@]+"${BUILD_CONTEXTS[@]}"}; do
+  BUILDX_OPTS+=(--build-context "$build_context")
+done
+for secret in ${SECRETS[@]+"${SECRETS[@]}"}; do
+  BUILDX_OPTS+=(--secret "$secret")
+done
+# JBoss マスターパスワードを environment 型シークレットとして注入する。
+# --secret の引数に含まれるのは id と環境変数名のみで、値そのものは含まれない
+# (dry-run のコマンドプレビューにも値は表示されない)。
+if [ "$JBOSS_SECRET_ENABLED" = "true" ]; then
+  BUILDX_OPTS+=(--secret "id=${JBOSS_SECRET_ID},env=${JBOSS_PASSWORD_ENV}")
+fi
 
 log "docker buildx build を実行します (dockerfile=${DOCKERFILE}, context=${BUILD_CONTEXT}) ..."
 if ! run docker buildx build "${BUILDX_OPTS[@]}" "$BUILD_CONTEXT"; then
